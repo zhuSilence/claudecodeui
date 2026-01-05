@@ -1,0 +1,27 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 每天检查一次上游更新 (UTC 时间)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/siteboon/claudecodeui.git
+          git fetch upstream
+          
+      - name: Sync with upstream
+        run: |
+          git checkout main
+          git merge upstream/main
+          git push origin main
