@@ -31,7 +31,7 @@ const c = {
     dim: (text) => `${colors.dim}${text}${colors.reset}`,
 };
 
-console.log('PORT from env:', process.env.PORT);
+console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -44,8 +44,8 @@ import pty from 'node-pty';
 import fetch from 'node-fetch';
 import mime from 'mime-types';
 
-import { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache } from './projects.js';
-import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getActiveClaudeSDKSessions, resolveToolApproval } from './claude-sdk.js';
+import { getProjects, getSessions, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache, searchConversations } from './projects.js';
+import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getActiveClaudeSDKSessions, resolveToolApproval, getPendingApprovalsForSession, reconnectSessionWriter } from './claude-sdk.js';
 import { spawnCursor, abortCursorSession, isCursorSessionActive, getActiveCursorSessions } from './cursor-cli.js';
 import { queryCodex, abortCodexSession, isCodexSessionActive, getActiveCodexSessions } from './openai-codex.js';
 import { spawnGemini, abortGeminiSession, isGeminiSessionActive, getActiveGeminiSessions } from './gemini-cli.js';
@@ -64,9 +64,17 @@ import cliAuthRoutes from './routes/cli-auth.js';
 import userRoutes from './routes/user.js';
 import codexRoutes from './routes/codex.js';
 import geminiRoutes from './routes/gemini.js';
-import { initializeDatabase } from './database/db.js';
+import pluginsRoutes from './routes/plugins.js';
+import messagesRoutes from './routes/messages.js';
+import { createNormalizedMessage } from './providers/types.js';
+import { startEnabledPluginServers, stopAllPlugins, getPluginPort } from './utils/plugin-process-manager.js';
+import { initializeDatabase, sessionNamesDb, applyCustomSessionNames } from './database/db.js';
+import { configureWebPush } from './services/vapid-keys.js';
 import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
 import { IS_PLATFORM } from './constants/config.js';
+import { getConnectableHost } from '../shared/networkHosts.js';
+
+const VALID_PROVIDERS = ['claude', 'codex', 'cursor', 'gemini'];
 
 // File system watchers for provider project/session folders
 const PROVIDER_WATCH_PATHS = [
@@ -322,7 +330,7 @@ const wss = new WebSocketServer({
 // Make WebSocket server available to routes
 app.locals.wss = wss;
 
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Refreshed-Token'] }));
 app.use(express.json({
     limit: '50mb',
     type: (req) => {
@@ -387,6 +395,12 @@ app.use('/api/codex', authenticateToken, codexRoutes);
 // Gemini API Routes (protected)
 app.use('/api/gemini', authenticateToken, geminiRoutes);
 
+// Plugins API Routes (protected)
+app.use('/api/plugins', authenticateToken, pluginsRoutes);
+
+// Unified session messages route (protected)
+app.use('/api/sessions', authenticateToken, messagesRoutes);
+
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', agentRoutes);
 
@@ -424,7 +438,7 @@ app.post('/api/system/update', authenticateToken, async (req, res) => {
         // Run the update command based on install mode
         const updateCommand = installMode === 'git'
             ? 'git checkout main && git pull && npm install'
-            : 'npm install -g @siteboon/claude-code-ui@latest';
+            : 'npm install -g @cloudcli-ai/cloudcli@latest';
 
         const child = spawn('sh', ['-c', updateCommand], {
             cwd: installMode === 'git' ? projectRoot : os.homedir(),
@@ -493,32 +507,8 @@ app.get('/api/projects/:projectName/sessions', authenticateToken, async (req, re
     try {
         const { limit = 5, offset = 0 } = req.query;
         const result = await getSessions(req.params.projectName, parseInt(limit), parseInt(offset));
+        applyCustomSessionNames(result.sessions, 'claude');
         res.json(result);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get messages for a specific session
-app.get('/api/projects/:projectName/sessions/:sessionId/messages', authenticateToken, async (req, res) => {
-    try {
-        const { projectName, sessionId } = req.params;
-        const { limit, offset } = req.query;
-
-        // Parse limit and offset if provided
-        const parsedLimit = limit ? parseInt(limit, 10) : null;
-        const parsedOffset = offset ? parseInt(offset, 10) : 0;
-
-        const result = await getSessionMessages(projectName, sessionId, parsedLimit, parsedOffset);
-
-        // Handle both old and new response formats
-        if (Array.isArray(result)) {
-            // Backward compatibility: no pagination parameters were provided
-            res.json({ messages: result });
-        } else {
-            // New format with pagination info
-            res.json(result);
-        }
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -541,10 +531,37 @@ app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, 
         const { projectName, sessionId } = req.params;
         console.log(`[API] Deleting session: ${sessionId} from project: ${projectName}`);
         await deleteSession(projectName, sessionId);
+        sessionNamesDb.deleteName(sessionId, 'claude');
         console.log(`[API] Session ${sessionId} deleted successfully`);
         res.json({ success: true });
     } catch (error) {
         console.error(`[API] Error deleting session ${req.params.sessionId}:`, error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Rename session endpoint
+app.put('/api/sessions/:sessionId/rename', authenticateToken, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const safeSessionId = String(sessionId).replace(/[^a-zA-Z0-9._-]/g, '');
+        if (!safeSessionId || safeSessionId !== String(sessionId)) {
+            return res.status(400).json({ error: 'Invalid sessionId' });
+        }
+        const { summary, provider } = req.body;
+        if (!summary || typeof summary !== 'string' || summary.trim() === '') {
+            return res.status(400).json({ error: 'Summary is required' });
+        }
+        if (summary.trim().length > 500) {
+            return res.status(400).json({ error: 'Summary must not exceed 500 characters' });
+        }
+        if (!provider || !VALID_PROVIDERS.includes(provider)) {
+            return res.status(400).json({ error: `Provider must be one of: ${VALID_PROVIDERS.join(', ')}` });
+        }
+        sessionNamesDb.setName(safeSessionId, provider, summary.trim());
+        res.json({ success: true });
+    } catch (error) {
+        console.error(`[API] Error renaming session ${req.params.sessionId}:`, error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -575,6 +592,51 @@ app.post('/api/projects/create', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Error creating project:', error);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// Search conversations content (SSE streaming)
+app.get('/api/search/conversations', authenticateToken, async (req, res) => {
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const parsedLimit = Number.parseInt(String(req.query.limit), 10);
+    const limit = Number.isNaN(parsedLimit) ? 50 : Math.max(1, Math.min(parsedLimit, 100));
+
+    if (query.length < 2) {
+        return res.status(400).json({ error: 'Query must be at least 2 characters' });
+    }
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+
+    let closed = false;
+    const abortController = new AbortController();
+    req.on('close', () => { closed = true; abortController.abort(); });
+
+    try {
+        await searchConversations(query, limit, ({ projectResult, totalMatches, scannedProjects, totalProjects }) => {
+            if (closed) return;
+            if (projectResult) {
+                res.write(`event: result\ndata: ${JSON.stringify({ projectResult, totalMatches, scannedProjects, totalProjects })}\n\n`);
+            } else {
+                res.write(`event: progress\ndata: ${JSON.stringify({ totalMatches, scannedProjects, totalProjects })}\n\n`);
+            }
+        }, abortController.signal);
+        if (!closed) {
+            res.write(`event: done\ndata: {}\n\n`);
+        }
+    } catch (error) {
+        console.error('Error searching conversations:', error);
+        if (!closed) {
+            res.write(`event: error\ndata: ${JSON.stringify({ error: 'Search failed' })}\n\n`);
+        }
+    } finally {
+        if (!closed) {
+            res.end();
+        }
     }
 });
 
@@ -876,13 +938,486 @@ app.get('/api/projects/:projectName/files', authenticateToken, async (req, res) 
         }
 
         const files = await getFileTree(actualPath, 10, 0, true);
-        const hiddenFiles = files.filter(f => f.name.startsWith('.'));
         res.json(files);
     } catch (error) {
         console.error('[ERROR] File tree error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
+
+// ============================================================================
+// FILE OPERATIONS API ENDPOINTS
+// ============================================================================
+
+/**
+ * Validate that a path is within the project root
+ * @param {string} projectRoot - The project root path
+ * @param {string} targetPath - The path to validate
+ * @returns {{ valid: boolean, resolved?: string, error?: string }}
+ */
+function validatePathInProject(projectRoot, targetPath) {
+    const resolved = path.isAbsolute(targetPath)
+        ? path.resolve(targetPath)
+        : path.resolve(projectRoot, targetPath);
+    const normalizedRoot = path.resolve(projectRoot) + path.sep;
+    if (!resolved.startsWith(normalizedRoot)) {
+        return { valid: false, error: 'Path must be under project root' };
+    }
+    return { valid: true, resolved };
+}
+
+/**
+ * Validate filename - check for invalid characters
+ * @param {string} name - The filename to validate
+ * @returns {{ valid: boolean, error?: string }}
+ */
+function validateFilename(name) {
+    if (!name || !name.trim()) {
+        return { valid: false, error: 'Filename cannot be empty' };
+    }
+    // Check for invalid characters (Windows + Unix)
+    const invalidChars = /[<>:"/\\|?*\x00-\x1f]/;
+    if (invalidChars.test(name)) {
+        return { valid: false, error: 'Filename contains invalid characters' };
+    }
+    // Check for reserved names (Windows)
+    const reserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+    if (reserved.test(name)) {
+        return { valid: false, error: 'Filename is a reserved name' };
+    }
+    // Check for dots only
+    if (/^\.+$/.test(name)) {
+        return { valid: false, error: 'Filename cannot be only dots' };
+    }
+    return { valid: true };
+}
+
+// POST /api/projects/:projectName/files/create - Create new file or directory
+app.post('/api/projects/:projectName/files/create', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const { path: parentPath, type, name } = req.body;
+
+        // Validate input
+        if (!name || !type) {
+            return res.status(400).json({ error: 'Name and type are required' });
+        }
+
+        if (!['file', 'directory'].includes(type)) {
+            return res.status(400).json({ error: 'Type must be "file" or "directory"' });
+        }
+
+        const nameValidation = validateFilename(name);
+        if (!nameValidation.valid) {
+            return res.status(400).json({ error: nameValidation.error });
+        }
+
+        // Get project root
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Build and validate target path
+        const targetDir = parentPath || '';
+        const targetPath = targetDir ? path.join(targetDir, name) : name;
+        const validation = validatePathInProject(projectRoot, targetPath);
+        if (!validation.valid) {
+            return res.status(403).json({ error: validation.error });
+        }
+
+        const resolvedPath = validation.resolved;
+
+        // Check if already exists
+        try {
+            await fsPromises.access(resolvedPath);
+            return res.status(409).json({ error: `${type === 'file' ? 'File' : 'Directory'} already exists` });
+        } catch {
+            // Doesn't exist, which is what we want
+        }
+
+        // Create file or directory
+        if (type === 'directory') {
+            await fsPromises.mkdir(resolvedPath, { recursive: false });
+        } else {
+            // Ensure parent directory exists
+            const parentDir = path.dirname(resolvedPath);
+            try {
+                await fsPromises.access(parentDir);
+            } catch {
+                await fsPromises.mkdir(parentDir, { recursive: true });
+            }
+            await fsPromises.writeFile(resolvedPath, '', 'utf8');
+        }
+
+        res.json({
+            success: true,
+            path: resolvedPath,
+            name,
+            type,
+            message: `${type === 'file' ? 'File' : 'Directory'} created successfully`
+        });
+    } catch (error) {
+        console.error('Error creating file/directory:', error);
+        if (error.code === 'EACCES') {
+            res.status(403).json({ error: 'Permission denied' });
+        } else if (error.code === 'ENOENT') {
+            res.status(404).json({ error: 'Parent directory not found' });
+        } else {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// PUT /api/projects/:projectName/files/rename - Rename file or directory
+app.put('/api/projects/:projectName/files/rename', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const { oldPath, newName } = req.body;
+
+        // Validate input
+        if (!oldPath || !newName) {
+            return res.status(400).json({ error: 'oldPath and newName are required' });
+        }
+
+        const nameValidation = validateFilename(newName);
+        if (!nameValidation.valid) {
+            return res.status(400).json({ error: nameValidation.error });
+        }
+
+        // Get project root
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Validate old path
+        const oldValidation = validatePathInProject(projectRoot, oldPath);
+        if (!oldValidation.valid) {
+            return res.status(403).json({ error: oldValidation.error });
+        }
+
+        const resolvedOldPath = oldValidation.resolved;
+
+        // Check if old path exists
+        try {
+            await fsPromises.access(resolvedOldPath);
+        } catch {
+            return res.status(404).json({ error: 'File or directory not found' });
+        }
+
+        // Build and validate new path
+        const parentDir = path.dirname(resolvedOldPath);
+        const resolvedNewPath = path.join(parentDir, newName);
+        const newValidation = validatePathInProject(projectRoot, resolvedNewPath);
+        if (!newValidation.valid) {
+            return res.status(403).json({ error: newValidation.error });
+        }
+
+        // Check if new path already exists
+        try {
+            await fsPromises.access(resolvedNewPath);
+            return res.status(409).json({ error: 'A file or directory with this name already exists' });
+        } catch {
+            // Doesn't exist, which is what we want
+        }
+
+        // Rename
+        await fsPromises.rename(resolvedOldPath, resolvedNewPath);
+
+        res.json({
+            success: true,
+            oldPath: resolvedOldPath,
+            newPath: resolvedNewPath,
+            newName,
+            message: 'Renamed successfully'
+        });
+    } catch (error) {
+        console.error('Error renaming file/directory:', error);
+        if (error.code === 'EACCES') {
+            res.status(403).json({ error: 'Permission denied' });
+        } else if (error.code === 'ENOENT') {
+            res.status(404).json({ error: 'File or directory not found' });
+        } else if (error.code === 'EXDEV') {
+            res.status(400).json({ error: 'Cannot move across different filesystems' });
+        } else {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// DELETE /api/projects/:projectName/files - Delete file or directory
+app.delete('/api/projects/:projectName/files', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const { path: targetPath, type } = req.body;
+
+        // Validate input
+        if (!targetPath) {
+            return res.status(400).json({ error: 'Path is required' });
+        }
+
+        // Get project root
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Validate path
+        const validation = validatePathInProject(projectRoot, targetPath);
+        if (!validation.valid) {
+            return res.status(403).json({ error: validation.error });
+        }
+
+        const resolvedPath = validation.resolved;
+
+        // Check if path exists and get stats
+        let stats;
+        try {
+            stats = await fsPromises.stat(resolvedPath);
+        } catch {
+            return res.status(404).json({ error: 'File or directory not found' });
+        }
+
+        // Prevent deleting the project root itself
+        if (resolvedPath === path.resolve(projectRoot)) {
+            return res.status(403).json({ error: 'Cannot delete project root directory' });
+        }
+
+        // Delete based on type
+        if (stats.isDirectory()) {
+            await fsPromises.rm(resolvedPath, { recursive: true, force: true });
+        } else {
+            await fsPromises.unlink(resolvedPath);
+        }
+
+        res.json({
+            success: true,
+            path: resolvedPath,
+            type: stats.isDirectory() ? 'directory' : 'file',
+            message: 'Deleted successfully'
+        });
+    } catch (error) {
+        console.error('Error deleting file/directory:', error);
+        if (error.code === 'EACCES') {
+            res.status(403).json({ error: 'Permission denied' });
+        } else if (error.code === 'ENOENT') {
+            res.status(404).json({ error: 'File or directory not found' });
+        } else if (error.code === 'ENOTEMPTY') {
+            res.status(400).json({ error: 'Directory is not empty' });
+        } else {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+// POST /api/projects/:projectName/files/upload - Upload files
+// Dynamic import of multer for file uploads
+const uploadFilesHandler = async (req, res) => {
+    // Dynamic import of multer
+    const multer = (await import('multer')).default;
+
+    const uploadMiddleware = multer({
+        storage: multer.diskStorage({
+            destination: (req, file, cb) => {
+                cb(null, os.tmpdir());
+            },
+            filename: (req, file, cb) => {
+                // Use a unique temp name, but preserve original name in file.originalname
+                // Note: file.originalname may contain path separators for folder uploads
+                const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+                // For temp file, just use a safe unique name without the path
+                cb(null, `upload-${uniqueSuffix}`);
+            }
+        }),
+        limits: {
+            fileSize: 50 * 1024 * 1024, // 50MB limit
+            files: 20 // Max 20 files at once
+        }
+    });
+
+    // Use multer middleware
+    uploadMiddleware.array('files', 20)(req, res, async (err) => {
+        if (err) {
+            console.error('Multer error:', err);
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(400).json({ error: 'File too large. Maximum size is 50MB.' });
+            }
+            if (err.code === 'LIMIT_FILE_COUNT') {
+                return res.status(400).json({ error: 'Too many files. Maximum is 20 files.' });
+            }
+            return res.status(500).json({ error: err.message });
+        }
+
+        try {
+            const { projectName } = req.params;
+            const { targetPath, relativePaths } = req.body;
+
+            // Parse relative paths if provided (for folder uploads)
+            let filePaths = [];
+            if (relativePaths) {
+                try {
+                    filePaths = JSON.parse(relativePaths);
+                } catch (e) {
+                    console.log('[DEBUG] Failed to parse relativePaths:', relativePaths);
+                }
+            }
+
+            console.log('[DEBUG] File upload request:', {
+                projectName,
+                targetPath: JSON.stringify(targetPath),
+                targetPathType: typeof targetPath,
+                filesCount: req.files?.length,
+                relativePaths: filePaths
+            });
+
+            if (!req.files || req.files.length === 0) {
+                return res.status(400).json({ error: 'No files provided' });
+            }
+
+            // Get project root
+            const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+            if (!projectRoot) {
+                return res.status(404).json({ error: 'Project not found' });
+            }
+
+            console.log('[DEBUG] Project root:', projectRoot);
+
+            // Validate and resolve target path
+            // If targetPath is empty or '.', use project root directly
+            const targetDir = targetPath || '';
+            let resolvedTargetDir;
+
+            console.log('[DEBUG] Target dir:', JSON.stringify(targetDir));
+
+            if (!targetDir || targetDir === '.' || targetDir === './') {
+                // Empty path means upload to project root
+                resolvedTargetDir = path.resolve(projectRoot);
+                console.log('[DEBUG] Using project root as target:', resolvedTargetDir);
+            } else {
+                const validation = validatePathInProject(projectRoot, targetDir);
+                if (!validation.valid) {
+                    console.log('[DEBUG] Path validation failed:', validation.error);
+                    return res.status(403).json({ error: validation.error });
+                }
+                resolvedTargetDir = validation.resolved;
+                console.log('[DEBUG] Resolved target dir:', resolvedTargetDir);
+            }
+
+            // Ensure target directory exists
+            try {
+                await fsPromises.access(resolvedTargetDir);
+            } catch {
+                await fsPromises.mkdir(resolvedTargetDir, { recursive: true });
+            }
+
+            // Move uploaded files from temp to target directory
+            const uploadedFiles = [];
+            console.log('[DEBUG] Processing files:', req.files.map(f => ({ originalname: f.originalname, path: f.path })));
+            for (let i = 0; i < req.files.length; i++) {
+                const file = req.files[i];
+                // Use relative path if provided (for folder uploads), otherwise use originalname
+                const fileName = (filePaths && filePaths[i]) ? filePaths[i] : file.originalname;
+                console.log('[DEBUG] Processing file:', fileName, '(originalname:', file.originalname + ')');
+                const destPath = path.join(resolvedTargetDir, fileName);
+
+                // Validate destination path
+                const destValidation = validatePathInProject(projectRoot, destPath);
+                if (!destValidation.valid) {
+                    console.log('[DEBUG] Destination validation failed for:', destPath);
+                    // Clean up temp file
+                    await fsPromises.unlink(file.path).catch(() => {});
+                    continue;
+                }
+
+                // Ensure parent directory exists (for nested files from folder upload)
+                const parentDir = path.dirname(destPath);
+                try {
+                    await fsPromises.access(parentDir);
+                } catch {
+                    await fsPromises.mkdir(parentDir, { recursive: true });
+                }
+
+                // Move file (copy + unlink to handle cross-device scenarios)
+                await fsPromises.copyFile(file.path, destPath);
+                await fsPromises.unlink(file.path);
+
+                uploadedFiles.push({
+                    name: fileName,
+                    path: destPath,
+                    size: file.size,
+                    mimeType: file.mimetype
+                });
+            }
+
+            res.json({
+                success: true,
+                files: uploadedFiles,
+                targetPath: resolvedTargetDir,
+                message: `Uploaded ${uploadedFiles.length} file(s) successfully`
+            });
+        } catch (error) {
+            console.error('Error uploading files:', error);
+            // Clean up any remaining temp files
+            if (req.files) {
+                for (const file of req.files) {
+                    await fsPromises.unlink(file.path).catch(() => {});
+                }
+            }
+            if (error.code === 'EACCES') {
+                res.status(403).json({ error: 'Permission denied' });
+            } else {
+                res.status(500).json({ error: error.message });
+            }
+        }
+    });
+};
+
+app.post('/api/projects/:projectName/files/upload', authenticateToken, uploadFilesHandler);
+
+/**
+ * Proxy an authenticated client WebSocket to a plugin's internal WS server.
+ * Auth is enforced by verifyClient before this function is reached.
+ */
+function handlePluginWsProxy(clientWs, pathname) {
+    const pluginName = pathname.replace('/plugin-ws/', '');
+    if (!pluginName || /[^a-zA-Z0-9_-]/.test(pluginName)) {
+        clientWs.close(4400, 'Invalid plugin name');
+        return;
+    }
+
+    const port = getPluginPort(pluginName);
+    if (!port) {
+        clientWs.close(4404, 'Plugin not running');
+        return;
+    }
+
+    const upstream = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+
+    upstream.on('open', () => {
+        console.log(`[Plugins] WS proxy connected to "${pluginName}" on port ${port}`);
+    });
+
+    // Relay messages bidirectionally
+    upstream.on('message', (data) => {
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+    });
+    clientWs.on('message', (data) => {
+        if (upstream.readyState === WebSocket.OPEN) upstream.send(data);
+    });
+
+    // Propagate close in both directions
+    upstream.on('close', () => { if (clientWs.readyState === WebSocket.OPEN) clientWs.close(); });
+    clientWs.on('close', () => { if (upstream.readyState === WebSocket.OPEN) upstream.close(); });
+
+    upstream.on('error', (err) => {
+        console.error(`[Plugins] WS proxy error for "${pluginName}":`, err.message);
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.close(4502, 'Upstream error');
+    });
+    clientWs.on('error', () => {
+        if (upstream.readyState === WebSocket.OPEN) upstream.close();
+    });
+}
 
 // WebSocket connection handler that routes based on URL path
 wss.on('connection', (ws, request) => {
@@ -896,7 +1431,9 @@ wss.on('connection', (ws, request) => {
     if (pathname === '/shell') {
         handleShellConnection(ws);
     } else if (pathname === '/ws') {
-        handleChatConnection(ws);
+        handleChatConnection(ws, request);
+    } else if (pathname.startsWith('/plugin-ws/')) {
+        handlePluginWsProxy(ws, pathname);
     } else {
         console.log('[WARN] Unknown WebSocket path:', pathname);
         ws.close();
@@ -905,19 +1442,27 @@ wss.on('connection', (ws, request) => {
 
 /**
  * WebSocket Writer - Wrapper for WebSocket to match SSEStreamWriter interface
+ *
+ * Provider files use `createNormalizedMessage()` from `providers/types.js` and
+ * adapter `normalizeMessage()` to produce unified NormalizedMessage events.
+ * The writer simply serialises and sends.
  */
 class WebSocketWriter {
-    constructor(ws) {
+    constructor(ws, userId = null) {
         this.ws = ws;
         this.sessionId = null;
+        this.userId = userId;
         this.isWebSocketWriter = true;  // Marker for transport detection
     }
 
     send(data) {
         if (this.ws.readyState === 1) { // WebSocket.OPEN
-            // Providers send raw objects, we stringify for WebSocket
             this.ws.send(JSON.stringify(data));
         }
+    }
+
+    updateWebSocket(newRawWs) {
+        this.ws = newRawWs;
     }
 
     setSessionId(sessionId) {
@@ -930,14 +1475,14 @@ class WebSocketWriter {
 }
 
 // Handle chat WebSocket connections
-function handleChatConnection(ws) {
+function handleChatConnection(ws, request) {
     console.log('[INFO] Chat WebSocket connected');
 
     // Add to connected clients for project updates
     connectedClients.add(ws);
 
     // Wrap WebSocket with writer for consistent interface with SSEStreamWriter
-    const writer = new WebSocketWriter(ws);
+    const writer = new WebSocketWriter(ws, request?.user?.id ?? request?.user?.userId ?? null);
 
     ws.on('message', async (message) => {
         try {
@@ -992,12 +1537,7 @@ function handleChatConnection(ws) {
                     success = await abortClaudeSDKSession(data.sessionId);
                 }
 
-                writer.send({
-                    type: 'session-aborted',
-                    sessionId: data.sessionId,
-                    provider,
-                    success
-                });
+                writer.send(createNormalizedMessage({ kind: 'complete', exitCode: success ? 0 : 1, aborted: true, success, sessionId: data.sessionId, provider }));
             } else if (data.type === 'claude-permission-response') {
                 // Relay UI approval decisions back into the SDK control flow.
                 // This does not persist permissions; it only resolves the in-flight request,
@@ -1013,12 +1553,7 @@ function handleChatConnection(ws) {
             } else if (data.type === 'cursor-abort') {
                 console.log('[DEBUG] Abort Cursor session:', data.sessionId);
                 const success = abortCursorSession(data.sessionId);
-                writer.send({
-                    type: 'session-aborted',
-                    sessionId: data.sessionId,
-                    provider: 'cursor',
-                    success
-                });
+                writer.send(createNormalizedMessage({ kind: 'complete', exitCode: success ? 0 : 1, aborted: true, success, sessionId: data.sessionId, provider: 'cursor' }));
             } else if (data.type === 'check-session-status') {
                 // Check if a specific session is currently processing
                 const provider = data.provider || 'claude';
@@ -1034,6 +1569,11 @@ function handleChatConnection(ws) {
                 } else {
                     // Use Claude Agents SDK
                     isActive = isClaudeSDKSessionActive(sessionId);
+                    if (isActive) {
+                        // Reconnect the session's writer to the new WebSocket so
+                        // subsequent SDK output flows to the refreshed client.
+                        reconnectSessionWriter(sessionId, ws);
+                    }
                 }
 
                 writer.send({
@@ -1042,6 +1582,17 @@ function handleChatConnection(ws) {
                     provider,
                     isProcessing: isActive
                 });
+            } else if (data.type === 'get-pending-permissions') {
+                // Return pending permission requests for a session
+                const sessionId = data.sessionId;
+                if (sessionId && isClaudeSDKSessionActive(sessionId)) {
+                    const pending = getPendingApprovalsForSession(sessionId);
+                    writer.send({
+                        type: 'pending-permissions-response',
+                        sessionId,
+                        data: pending
+                    });
+                }
             } else if (data.type === 'get-active-sessions') {
                 // Get all currently active sessions
                 const activeSessions = {
@@ -1169,50 +1720,49 @@ function handleShellConnection(ws) {
                 }));
 
                 try {
-                    // Prepare the shell command adapted to the platform and provider
+                    // Validate projectPath — resolve to absolute and verify it exists
+                    const resolvedProjectPath = path.resolve(projectPath);
+                    try {
+                        const stats = fs.statSync(resolvedProjectPath);
+                        if (!stats.isDirectory()) {
+                            throw new Error('Not a directory');
+                        }
+                    } catch (pathErr) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Invalid project path' }));
+                        return;
+                    }
+
+                    // Validate sessionId — only allow safe characters
+                    const safeSessionIdPattern = /^[a-zA-Z0-9_.\-:]+$/;
+                    if (sessionId && !safeSessionIdPattern.test(sessionId)) {
+                        ws.send(JSON.stringify({ type: 'error', message: 'Invalid session ID' }));
+                        return;
+                    }
+
+                    // Build shell command — use cwd for project path (never interpolate into shell string)
                     let shellCommand;
                     if (isPlainShell) {
-                        // Plain shell mode - just run the initial command in the project directory
-                        if (os.platform() === 'win32') {
-                            shellCommand = `Set-Location -Path "${projectPath}"; ${initialCommand}`;
-                        } else {
-                            shellCommand = `cd "${projectPath}" && ${initialCommand}`;
-                        }
+                        // Plain shell mode - run the initial command in the project directory
+                        shellCommand = initialCommand;
                     } else if (provider === 'cursor') {
-                        // Use cursor-agent command
-                        if (os.platform() === 'win32') {
-                            if (hasSession && sessionId) {
-                                shellCommand = `Set-Location -Path "${projectPath}"; cursor-agent --resume="${sessionId}"`;
-                            } else {
-                                shellCommand = `Set-Location -Path "${projectPath}"; cursor-agent`;
-                            }
+                        if (hasSession && sessionId) {
+                            shellCommand = `cursor-agent --resume="${sessionId}"`;
                         } else {
-                            if (hasSession && sessionId) {
-                                shellCommand = `cd "${projectPath}" && cursor-agent --resume="${sessionId}"`;
-                            } else {
-                                shellCommand = `cd "${projectPath}" && cursor-agent`;
-                            }
+                            shellCommand = 'cursor-agent';
                         }
-
                     } else if (provider === 'codex') {
-                        // Use codex command
-                        if (os.platform() === 'win32') {
-                            if (hasSession && sessionId) {
-                                // Try to resume session, but with fallback to a new session if it fails
-                                shellCommand = `Set-Location -Path "${projectPath}"; codex resume "${sessionId}"; if ($LASTEXITCODE -ne 0) { codex }`;
+                        // Use codex command; attempt to resume and fall back to a new session when the resume fails.
+                        if (hasSession && sessionId) {
+                            if (os.platform() === 'win32') {
+                                // PowerShell syntax for fallback
+                                shellCommand = `codex resume "${sessionId}"; if ($LASTEXITCODE -ne 0) { codex }`;
                             } else {
-                                shellCommand = `Set-Location -Path "${projectPath}"; codex`;
+                                shellCommand = `codex resume "${sessionId}" || codex`;
                             }
                         } else {
-                            if (hasSession && sessionId) {
-                                // Try to resume session, but with fallback to a new session if it fails
-                                shellCommand = `cd "${projectPath}" && codex resume "${sessionId}" || codex`;
-                            } else {
-                                shellCommand = `cd "${projectPath}" && codex`;
-                            }
+                            shellCommand = 'codex';
                         }
                     } else if (provider === 'gemini') {
-                        // Use gemini command
                         const command = initialCommand || 'gemini';
                         let resumeId = sessionId;
                         if (hasSession && sessionId) {
@@ -1223,41 +1773,32 @@ function handleShellConnection(ws) {
                                 const sess = sessionManager.getSession(sessionId);
                                 if (sess && sess.cliSessionId) {
                                     resumeId = sess.cliSessionId;
+                                    // Validate the looked-up CLI session ID too
+                                    if (!safeSessionIdPattern.test(resumeId)) {
+                                        resumeId = null;
+                                    }
                                 }
                             } catch (err) {
                                 console.error('Failed to get Gemini CLI session ID:', err);
                             }
                         }
 
-                        if (os.platform() === 'win32') {
-                            if (hasSession && resumeId) {
-                                shellCommand = `Set-Location -Path "${projectPath}"; ${command} --resume "${resumeId}"`;
-                            } else {
-                                shellCommand = `Set-Location -Path "${projectPath}"; ${command}`;
-                            }
+                        if (hasSession && resumeId) {
+                            shellCommand = `${command} --resume "${resumeId}"`;
                         } else {
-                            if (hasSession && resumeId) {
-                                shellCommand = `cd "${projectPath}" && ${command} --resume "${resumeId}"`;
-                            } else {
-                                shellCommand = `cd "${projectPath}" && ${command}`;
-                            }
+                            shellCommand = command;
                         }
                     } else {
-                        // Use claude command (default) or initialCommand if provided
+                        // Claude (default provider)
                         const command = initialCommand || 'claude';
-                        if (os.platform() === 'win32') {
-                            if (hasSession && sessionId) {
-                                // Try to resume session, but with fallback to new session if it fails
-                                shellCommand = `Set-Location -Path "${projectPath}"; claude --resume ${sessionId}; if ($LASTEXITCODE -ne 0) { claude }`;
+                        if (hasSession && sessionId) {
+                            if (os.platform() === 'win32') {
+                                shellCommand = `claude --resume "${sessionId}"; if ($LASTEXITCODE -ne 0) { claude }`;
                             } else {
-                                shellCommand = `Set-Location -Path "${projectPath}"; ${command}`;
+                                shellCommand = `claude --resume "${sessionId}" || claude`;
                             }
                         } else {
-                            if (hasSession && sessionId) {
-                                shellCommand = `cd "${projectPath}" && claude --resume ${sessionId} || claude`;
-                            } else {
-                                shellCommand = `cd "${projectPath}" && ${command}`;
-                            }
+                            shellCommand = command;
                         }
                     }
 
@@ -1276,7 +1817,7 @@ function handleShellConnection(ws) {
                         name: 'xterm-256color',
                         cols: termCols,
                         rows: termRows,
-                        cwd: os.homedir(),
+                        cwd: resolvedProjectPath,
                         env: {
                             ...process.env,
                             TERM: 'xterm-256color',
@@ -1682,7 +2223,7 @@ app.get('/api/projects/:projectName/sessions/:sessionId/token-usage', authentica
 
         // Allow only safe characters in sessionId
         const safeSessionId = String(sessionId).replace(/[^a-zA-Z0-9._-]/g, '');
-        if (!safeSessionId) {
+        if (!safeSessionId || safeSessionId !== String(sessionId)) {
             return res.status(400).json({ error: 'Invalid sessionId' });
         }
 
@@ -1881,7 +2422,8 @@ app.get('*', (req, res) => {
         res.sendFile(indexPath);
     } else {
         // In development, redirect to Vite dev server only if dist doesn't exist
-        res.redirect(`http://localhost:${process.env.VITE_PORT || 5173}`);
+        const redirectHost = getConnectableHost(req.hostname);
+        res.redirect(`${req.protocol}://${redirectHost}:${VITE_PORT}`);
     }
 });
 
@@ -1969,10 +2511,10 @@ async function getFileTree(dirPath, maxDepth = 3, currentDepth = 0, showHidden =
     });
 }
 
-const PORT = process.env.PORT || 3001;
+const SERVER_PORT = process.env.SERVER_PORT || 3001;
 const HOST = process.env.HOST || '0.0.0.0';
-// Show localhost in URL when binding to all interfaces (0.0.0.0 isn't a connectable address)
-const DISPLAY_HOST = HOST === '0.0.0.0' ? 'localhost' : HOST;
+const DISPLAY_HOST = getConnectableHost(HOST);
+const VITE_PORT = process.env.VITE_PORT || 5173;
 
 // Initialize database and start server
 async function startServer() {
@@ -1980,19 +2522,24 @@ async function startServer() {
         // Initialize authentication database
         await initializeDatabase();
 
+        // Configure Web Push (VAPID keys)
+        configureWebPush();
+
         // Check if running in production mode (dist folder exists)
         const distIndexPath = path.join(__dirname, '../dist/index.html');
         const isProduction = fs.existsSync(distIndexPath);
 
         // Log Claude implementation mode
         console.log(`${c.info('[INFO]')} Using Claude Agents SDK for Claude integration`);
-        console.log(`${c.info('[INFO]')} Running in ${c.bright(isProduction ? 'PRODUCTION' : 'DEVELOPMENT')} mode`);
+        console.log('');
 
-        if (!isProduction) {
-            console.log(`${c.warn('[WARN]')} Note: Requests will be proxied to Vite dev server at ${c.dim('http://localhost:' + (process.env.VITE_PORT || 5173))}`);
+        if (isProduction) {
+            console.log(`${c.info('[INFO]')} To run in production mode, go to http://${DISPLAY_HOST}:${SERVER_PORT}`);            
         }
 
-        server.listen(PORT, HOST, async () => {
+        console.log(`${c.info('[INFO]')} To run in development mode with hot-module replacement, go to http://${DISPLAY_HOST}:${VITE_PORT}`);
+   
+        server.listen(SERVER_PORT, HOST, async () => {
             const appInstallPath = path.join(__dirname, '..');
 
             console.log('');
@@ -2000,14 +2547,27 @@ async function startServer() {
             console.log(`  ${c.bright('Claude Code UI Server - Ready')}`);
             console.log(c.dim('═'.repeat(63)));
             console.log('');
-            console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + PORT)}`);
+            console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + SERVER_PORT)}`);
             console.log(`${c.info('[INFO]')} Installed at: ${c.dim(appInstallPath)}`);
             console.log(`${c.tip('[TIP]')}  Run "cloudcli status" for full configuration details`);
             console.log('');
 
             // Start watching the projects folder for changes
             await setupProjectsWatcher();
+
+            // Start server-side plugin processes for enabled plugins
+            startEnabledPluginServers().catch(err => {
+                console.error('[Plugins] Error during startup:', err.message);
+            });
         });
+
+        // Clean up plugin processes on shutdown
+        const shutdownPlugins = async () => {
+            await stopAllPlugins();
+            process.exit(0);
+        };
+        process.on('SIGTERM', () => void shutdownPlugins());
+        process.on('SIGINT', () => void shutdownPlugins());
     } catch (error) {
         console.error('[ERROR] Failed to start server:', error);
         process.exit(1);

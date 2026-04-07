@@ -11,9 +11,7 @@ import type {
 } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { authenticatedFetch } from '../../../utils/api';
-
 import { thinkingModes } from '../constants/thinkingModes';
-
 import { grantClaudeToolPermission } from '../utils/chatPermissions';
 import { safeLocalStorage } from '../utils/chatStorage';
 import type {
@@ -21,10 +19,10 @@ import type {
   PendingPermissionRequest,
   PermissionMode,
 } from '../types/types';
-import { useFileMentions } from './useFileMentions';
-import { type SlashCommand, useSlashCommands } from './useSlashCommands';
 import type { Project, ProjectSession, SessionProvider } from '../../../types/app';
 import { escapeRegExp } from '../utils/chatFormatting';
+import { useFileMentions } from './useFileMentions';
+import { type SlashCommand, useSlashCommands } from './useSlashCommands';
 
 type PendingViewSession = {
   sessionId: string | null;
@@ -54,8 +52,9 @@ interface UseChatComposerStateArgs {
   onShowSettings?: () => void;
   pendingViewSessionRef: { current: PendingViewSession | null };
   scrollToBottom: () => void;
-  setChatMessages: Dispatch<SetStateAction<ChatMessage[]>>;
-  setSessionMessages?: Dispatch<SetStateAction<any[]>>;
+  addMessage: (msg: ChatMessage) => void;
+  clearMessages: () => void;
+  rewindMessages: (count: number) => void;
   setIsLoading: (loading: boolean) => void;
   setCanAbortSession: (canAbort: boolean) => void;
   setClaudeStatus: (status: { text: string; tokens: number; can_interrupt: boolean } | null) => void;
@@ -84,6 +83,24 @@ const createFakeSubmitEvent = () => {
 const isTemporarySessionId = (sessionId: string | null | undefined) =>
   Boolean(sessionId && sessionId.startsWith('new-session-'));
 
+const getNotificationSessionSummary = (
+  selectedSession: ProjectSession | null,
+  fallbackInput: string,
+): string | null => {
+  const sessionSummary = selectedSession?.summary || selectedSession?.name || selectedSession?.title;
+  if (typeof sessionSummary === 'string' && sessionSummary.trim()) {
+    const normalized = sessionSummary.replace(/\s+/g, ' ').trim();
+    return normalized.length > 80 ? `${normalized.slice(0, 77)}...` : normalized;
+  }
+
+  const normalizedFallback = fallbackInput.replace(/\s+/g, ' ').trim();
+  if (!normalizedFallback) {
+    return null;
+  }
+
+  return normalizedFallback.length > 80 ? `${normalizedFallback.slice(0, 77)}...` : normalizedFallback;
+};
+
 export function useChatComposerState({
   selectedProject,
   selectedSession,
@@ -107,8 +124,9 @@ export function useChatComposerState({
   onShowSettings,
   pendingViewSessionRef,
   scrollToBottom,
-  setChatMessages,
-  setSessionMessages,
+  addMessage,
+  clearMessages,
+  rewindMessages,
   setIsLoading,
   setCanAbortSession,
   setClaudeStatus,
@@ -139,69 +157,50 @@ export function useChatComposerState({
       const { action, data } = result;
       switch (action) {
         case 'clear':
-          setChatMessages([]);
-          setSessionMessages?.([]);
+          clearMessages();
           break;
 
         case 'help':
-          setChatMessages((previous) => [
-            ...previous,
-            {
-              type: 'assistant',
-              content: data.content,
-              timestamp: Date.now(),
-            },
-          ]);
+          addMessage({
+            type: 'assistant',
+            content: data.content,
+            timestamp: Date.now(),
+          });
           break;
 
         case 'model':
-          setChatMessages((previous) => [
-            ...previous,
-            {
-              type: 'assistant',
-              content: `**Current Model**: ${data.current.model}\n\n**Available Models**:\n\nClaude: ${data.available.claude.join(', ')}\n\nCursor: ${data.available.cursor.join(', ')}`,
-              timestamp: Date.now(),
-            },
-          ]);
+          addMessage({
+            type: 'assistant',
+            content: `**Current Model**: ${data.current.model}\n\n**Available Models**:\n\nClaude: ${data.available.claude.join(', ')}\n\nCursor: ${data.available.cursor.join(', ')}`,
+            timestamp: Date.now(),
+          });
           break;
 
         case 'cost': {
           const costMessage = `**Token Usage**: ${data.tokenUsage.used.toLocaleString()} / ${data.tokenUsage.total.toLocaleString()} (${data.tokenUsage.percentage}%)\n\n**Estimated Cost**:\n- Input: $${data.cost.input}\n- Output: $${data.cost.output}\n- **Total**: $${data.cost.total}\n\n**Model**: ${data.model}`;
-          setChatMessages((previous) => [
-            ...previous,
-            { type: 'assistant', content: costMessage, timestamp: Date.now() },
-          ]);
+          addMessage({ type: 'assistant', content: costMessage, timestamp: Date.now() });
           break;
         }
 
         case 'status': {
           const statusMessage = `**System Status**\n\n- Version: ${data.version}\n- Uptime: ${data.uptime}\n- Model: ${data.model}\n- Provider: ${data.provider}\n- Node.js: ${data.nodeVersion}\n- Platform: ${data.platform}`;
-          setChatMessages((previous) => [
-            ...previous,
-            { type: 'assistant', content: statusMessage, timestamp: Date.now() },
-          ]);
+          addMessage({ type: 'assistant', content: statusMessage, timestamp: Date.now() });
           break;
         }
 
         case 'memory':
           if (data.error) {
-            setChatMessages((previous) => [
-              ...previous,
-              {
-                type: 'assistant',
-                content: `⚠️ ${data.message}`,
-                timestamp: Date.now(),
-              },
-            ]);
+            addMessage({
+              type: 'assistant',
+              content: `Warning: ${data.message}`,
+              timestamp: Date.now(),
+            });
           } else {
-            setChatMessages((previous) => [
-              ...previous,
-              {
-                type: 'assistant',
-                content: `📝 ${data.message}\n\nPath: \`${data.path}\``,
-                timestamp: Date.now(),
-              },
-            ]);
+            addMessage({
+              type: 'assistant',
+              content: `${data.message}\n\nPath: \`${data.path}\``,
+              timestamp: Date.now(),
+            });
             if (data.exists && onFileOpen) {
               onFileOpen(data.path);
             }
@@ -214,24 +213,18 @@ export function useChatComposerState({
 
         case 'rewind':
           if (data.error) {
-            setChatMessages((previous) => [
-              ...previous,
-              {
-                type: 'assistant',
-                content: `⚠️ ${data.message}`,
-                timestamp: Date.now(),
-              },
-            ]);
+            addMessage({
+              type: 'assistant',
+              content: `Warning: ${data.message}`,
+              timestamp: Date.now(),
+            });
           } else {
-            setChatMessages((previous) => previous.slice(0, -data.steps * 2));
-            setChatMessages((previous) => [
-              ...previous,
-              {
-                type: 'assistant',
-                content: `⏪ ${data.message}`,
-                timestamp: Date.now(),
-              },
-            ]);
+            rewindMessages(data.steps * 2);
+            addMessage({
+              type: 'assistant',
+              content: `Rewound ${data.steps} step(s). ${data.message}`,
+              timestamp: Date.now(),
+            });
           }
           break;
 
@@ -239,7 +232,7 @@ export function useChatComposerState({
           console.warn('Unknown built-in command action:', action);
       }
     },
-    [onFileOpen, onShowSettings, setChatMessages, setSessionMessages],
+    [onFileOpen, onShowSettings, addMessage, clearMessages, rewindMessages],
   );
 
   const handleCustomCommand = useCallback(async (result: CommandExecutionResult) => {
@@ -250,14 +243,11 @@ export function useChatComposerState({
         'This command contains bash commands that will be executed. Do you want to proceed?',
       );
       if (!confirmed) {
-        setChatMessages((previous) => [
-          ...previous,
-          {
-            type: 'assistant',
-            content: '❌ Command execution cancelled',
-            timestamp: Date.now(),
-          },
-        ]);
+        addMessage({
+          type: 'assistant',
+          content: 'Command execution cancelled',
+          timestamp: Date.now(),
+        });
         return;
       }
     }
@@ -272,7 +262,7 @@ export function useChatComposerState({
         handleSubmitRef.current(createFakeSubmitEvent());
       }
     }, 0);
-  }, [setChatMessages]);
+  }, [addMessage]);
 
   const executeCommand = useCallback(
     async (command: SlashCommand, rawInput?: string) => {
@@ -330,14 +320,11 @@ export function useChatComposerState({
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         console.error('Error executing command:', error);
-        setChatMessages((previous) => [
-          ...previous,
-          {
-            type: 'assistant',
-            content: `Error executing command: ${message}`,
-            timestamp: Date.now(),
-          },
-        ]);
+        addMessage({
+          type: 'assistant',
+          content: `Error executing command: ${message}`,
+          timestamp: Date.now(),
+        });
       }
     },
     [
@@ -351,7 +338,7 @@ export function useChatComposerState({
       input,
       provider,
       selectedProject,
-      setChatMessages,
+      addMessage,
       tokenBudget,
     ],
   );
@@ -531,17 +518,18 @@ export function useChatComposerState({
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Unknown error';
           console.error('Image upload failed:', error);
-          setChatMessages((previous) => [
-            ...previous,
-            {
-              type: 'error',
-              content: `Failed to upload images: ${message}`,
-              timestamp: new Date(),
-            },
-          ]);
+          addMessage({
+            type: 'error',
+            content: `Failed to upload images: ${message}`,
+            timestamp: new Date(),
+          });
           return;
         }
       }
+
+      const effectiveSessionId =
+        currentSessionId || selectedSession?.id || sessionStorage.getItem('cursorSessionId');
+      const sessionToActivate = effectiveSessionId || `new-session-${Date.now()}`;
 
       const userMessage: ChatMessage = {
         type: 'user',
@@ -550,8 +538,8 @@ export function useChatComposerState({
         timestamp: new Date(),
       };
 
-      setChatMessages((previous) => [...previous, userMessage]);
-      setIsLoading(true);
+      addMessage(userMessage);
+      setIsLoading(true); // Processing banner starts
       setCanAbortSession(true);
       setClaudeStatus({
         text: 'Processing',
@@ -561,10 +549,6 @@ export function useChatComposerState({
 
       setIsUserScrolledUp(false);
       setTimeout(() => scrollToBottom(), 100);
-
-      const effectiveSessionId =
-        currentSessionId || selectedSession?.id || sessionStorage.getItem('cursorSessionId');
-      const sessionToActivate = effectiveSessionId || `new-session-${Date.now()}`;
 
       if (!effectiveSessionId && !selectedSession?.id) {
         if (typeof window !== 'undefined') {
@@ -605,6 +589,7 @@ export function useChatComposerState({
 
       const toolsSettings = getToolsSettings();
       const resolvedProjectPath = selectedProject.fullPath || selectedProject.path || '';
+      const sessionSummary = getNotificationSessionSummary(selectedSession, currentInput);
 
       if (provider === 'cursor') {
         sendMessage({
@@ -618,6 +603,7 @@ export function useChatComposerState({
             resume: Boolean(effectiveSessionId),
             model: cursorModel,
             skipPermissions: toolsSettings?.skipPermissions || false,
+            sessionSummary,
             toolsSettings,
           },
         });
@@ -632,6 +618,7 @@ export function useChatComposerState({
             sessionId: effectiveSessionId,
             resume: Boolean(effectiveSessionId),
             model: codexModel,
+            sessionSummary,
             permissionMode: permissionMode === 'plan' ? 'default' : permissionMode,
           },
         });
@@ -646,6 +633,7 @@ export function useChatComposerState({
             sessionId: effectiveSessionId,
             resume: Boolean(effectiveSessionId),
             model: geminiModel,
+            sessionSummary,
             permissionMode,
             toolsSettings,
           },
@@ -662,6 +650,7 @@ export function useChatComposerState({
             toolsSettings,
             permissionMode,
             model: claudeModel,
+            sessionSummary,
             images: uploadedImages,
           },
         });
@@ -683,6 +672,7 @@ export function useChatComposerState({
       safeLocalStorage.removeItem(`draft_input_${selectedProject.name}`);
     },
     [
+      selectedSession,
       attachedImages,
       claudeModel,
       codexModel,
@@ -699,10 +689,9 @@ export function useChatComposerState({
       resetCommandMenuState,
       scrollToBottom,
       selectedProject,
-      selectedSession?.id,
       sendMessage,
       setCanAbortSession,
-      setChatMessages,
+      addMessage,
       setClaudeStatus,
       setIsLoading,
       setIsUserScrolledUp,
